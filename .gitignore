@@ -1,0 +1,25 @@
+# 构建产物
+app/build/
+app/dist/
+app/.dart_tool/
+app/.flutter-plugins*
+app/.pub-cache/
+app/.pub/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 系统文件
+.DS_Store
+
+# 密钥与本地配置（泄漏风险）
+*.pfx
+*.p12
+app/android/key.properties
+app/android/app/upload-keystore.jks
+
+# Dart
+*.g.dart.tmp
+app/*.log

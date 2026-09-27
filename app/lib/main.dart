@@ -1,0 +1,607 @@
+import 'ui/product_routes.dart';
+import 'dart:async';
+import 'dart:io';
+
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:country_picker/country_picker.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:liquid_glass_widgets/liquid_glass_widgets.dart';
+import 'package:oktoast/oktoast.dart';
+import 'api/api.dart';
+import 'utils/toast.dart';
+import 'config/env.dart';
+import 'config/env_snapshot.dart';
+import 'color_theme.dart';
+import 'color_theme_store.dart';
+import 'font_size_store.dart';
+import 'typography.dart';
+import 'shortcut_preferences.dart';
+import 'logger.dart';
+import 'providers/app_locale.dart';
+import 'providers/auth_provider.dart';
+import 'providers/auth_session_provider.dart';
+import 'providers/pending_files_provider.dart';
+import 'models/pending_file_entry.dart';
+import 'theme_store.dart';
+import 'ui/app_ui.dart';
+import 'l10n/app_brand.dart';
+import 'l10n/generated/app_localizations.dart';
+import 'preferences/locale_region_store.dart';
+import 'screens/app_entry_screen.dart';
+import 'widgets/auth_session_lifecycle.dart';
+import 'widgets/realtime_hub_lifecycle.dart';
+import 'services/app_log_file.dart';
+import 'services/database.dart';
+import 'services/desktop_tray_lifecycle.dart';
+import 'services/analytics/analytics.dart';
+import 'services/analytics/analytics_events.dart';
+import 'services/desktop_paste_dispatcher.dart';
+import 'services/desktop_file_drop_dispatcher.dart';
+import 'services/share_receive_service.dart';
+import 'services/saf_storage_service.dart';
+import 'services/boot_best_effort.dart';
+import 'services/shared_preferences_bootstrap.dart';
+import 'services/windows_launch_at_startup_service.dart';
+import 'utils/runtime_platform.dart';
+import 'services/native_tab_bar_service.dart';
+import 'services/transfer_keep_alive.dart';
+import 'services/transfer_completion_notifier.dart';
+
+class _NoProxyHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    client.findProxy = (uri) => 'DIRECT';
+    return client;
+  }
+}
+
+/// 纯局域网版：已移除 Let's Encrypt 根证书注入（不再访问任何云端 HTTPS 服务）。
+void main(List<String> args) async {
+  HttpOverrides.global = _NoProxyHttpOverrides();
+  // Run the whole startup inside a guarded zone so async errors thrown before
+  // the first frame cannot silently abort main() into a blank window.
+  // ensureInitialized() and runApp() must live in the same zone.
+  runZonedGuarded<Future<void>>(
+    () async {
+      WidgetsFlutterBinding.ensureInitialized();
+      // Logging first: any failure during the rest of boot must reach the log
+      // file on disk. Otherwise a crash before the first frame is a silent
+      // white screen with no diagnostics (cf. 1.4.8 Windows white-screen).
+      await AppLogFile.instance.init();
+      initLogging();
+      _installBootErrorHandlers();
+      try {
+        await _bootstrap(args);
+      } catch (e, st) {
+        logBoot.severe('fatal boot error before first frame: $e', e, st);
+        runApp(
+          BootFailureApp(
+            error: e,
+            stackTrace: st,
+            logFilePath: AppLogFile.instance.currentLogFilePath,
+          ),
+        );
+      }
+    },
+    (error, stack) {
+      logBoot.severe('uncaught zone error: $error', error, stack);
+    },
+  );
+}
+
+/// Routes framework + platform-dispatcher errors into the on-disk log so a
+/// release build that white-screens still leaves a diagnosable trail.
+void _installBootErrorHandlers() {
+  final previousOnError = FlutterError.onError;
+  FlutterError.onError = (FlutterErrorDetails details) {
+    logBoot.severe(
+      'FlutterError: ${details.exceptionAsString()}',
+      details.exception,
+      details.stack,
+    );
+    previousOnError?.call(details);
+  };
+  WidgetsBinding.instance.platformDispatcher.onError = (error, stack) {
+    logBoot.severe('PlatformDispatcher uncaught error: $error', error, stack);
+    return true;
+  };
+}
+
+/// App startup sequence. Runs inside [runZonedGuarded] with logging already
+/// initialized, so any thrown error is captured and surfaced via
+/// [BootFailureApp] instead of producing a blank window.
+Future<void> _bootstrap(List<String> args) async {
+  // Step markers ('boot: ...'): on a hang or crash before the first frame, the
+  // last logged step localizes the failing init phase from the user's log.
+  logBoot.info('boot: begin (platform=${RuntimePlatform.osName})');
+  FlutterForegroundTask.initCommunicationPort();
+  await TransferKeepAlive.ensureInitialized();
+  await TransferCompletionNotifier.ensureInitialized();
+  logBoot.info('boot: keep-alive + notifier ready');
+  if (!Platform.isWindows) {
+    await LiquidGlassWidgets.initialize();
+    logBoot.info('boot: liquid glass initialized');
+  }
+  // 纯局域网版：不连接任何云端 HTTPS 服务，跳过 Let's Encrypt 根证书注入以加快启动。
+  await ensureSharedPreferencesReady();
+  logBoot.info('boot: shared preferences ready');
+  final launchedAtStartup = WindowsLaunchAtStartupService.isStartupLaunch(args);
+  if (Platform.isWindows) {
+    await bestEffortBootStep(
+      'windows launch at startup',
+      WindowsLaunchAtStartupService.syncWithPreference,
+    );
+  }
+
+  final localeRegionStore = LocaleRegionStore();
+  await localeRegionStore.loadSync();
+  await loadSendShortcutMode();
+  logBoot.info('boot: locale/region + shortcuts loaded');
+
+  // 纯局域网版：遥测（OpenPanel / Feedmatter）与云端更新检查均已移除。
+  logBoot.info('boot: opening database');
+  await AppDatabase.instance.open();
+  logBoot.info('boot: database opened');
+
+  if (Platform.isAndroid) {
+    await SafStorageService.restorePersistedTreeUris();
+  }
+
+  if (RuntimePlatform.isDesktop) {
+    DesktopPasteDispatcher.instance.ensureInstalled();
+  }
+
+  final container = ProviderContainer();
+  await container.read(authProvider.notifier).loadFromStorage();
+  final isLoggedIn = container.read(authProvider).isLoggedIn;
+  final offlineWithoutLogin = await loadOfflineWithoutLogin();
+  await localeRegionStore.applyLoggedInDefaultsIfNeeded(isLoggedIn);
+  logBoot.info('boot: auth/provider state loaded');
+
+  final authSession = container.read(authSessionControllerProvider.notifier);
+  authSession.onStorageLoaded(isLoggedIn: isLoggedIn);
+
+  Future<void> waitForStartupNetworkIfNeeded() async {
+    if (!Platform.isWindows || !launchedAtStartup) return;
+
+    const maxWait = Duration(seconds: 30);
+    const pollInterval = Duration(seconds: 1);
+    final deadline = DateTime.now().add(maxWait);
+    logAuth.info('startup network wait: begin maxWait=${maxWait.inSeconds}s');
+
+    while (DateTime.now().isBefore(deadline)) {
+      final results = await Connectivity().checkConnectivity();
+      if (results.any((r) => r != ConnectivityResult.none)) {
+        logAuth.info('startup network wait: connectivity available');
+        return;
+      }
+      await Future.delayed(pollInterval);
+    }
+
+    logAuth.warning(
+      'startup network wait: timed out after ${maxWait.inSeconds}s, continuing',
+    );
+  }
+
+  void syncAppLocaleFromStore() {
+    container.read(appLocaleProvider.notifier).state =
+        localeRegionStore.notifier.value.locale;
+  }
+
+  syncAppLocaleFromStore();
+  localeRegionStore.notifier.addListener(syncAppLocaleFromStore);
+
+  final navigatorKey = GlobalKey<NavigatorState>();
+
+  Future<void> invalidateSessionAndNavigate() async {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final ctx = navigatorKey.currentContext;
+      if (ctx != null && ctx.mounted) {
+        // 纯局域网版：无登录体系，会话失效仅回到首页（LAN 模式不受影响）。
+        Navigator.of(
+          ctx,
+        ).pushNamedAndRemoveUntil('/', (route) => route.isFirst);
+        final loc = localeRegionStore.notifier.value.locale;
+        AppToast.show(
+          ctx,
+          message: lookupAppLocalizations(loc).loginSessionExpired,
+        );
+      }
+    });
+  }
+
+  authSession.onSessionExpiredNavigate = invalidateSessionAndNavigate;
+
+  setAuthRetryHandler(authSession.handle401WithRetry);
+
+  if (isLoggedIn) {
+    unawaited(
+      authSession.bootstrapSession(
+        useRetry: launchedAtStartup || RuntimePlatform.isDesktop,
+        waitForNetwork: waitForStartupNetworkIfNeeded,
+      ),
+    );
+  }
+
+  logAuth.info('main auth loaded, isLoggedIn=$isLoggedIn');
+
+  // Boot env snapshot is scheduled to run after the first frame (see below):
+  // on cold start the IDE debug console attaches *after* main() begins, so
+  // any log emitted before the first paint is silently dropped. Hot
+  // reload/restart, by contrast, runs against an already-attached console
+  // which is why the snapshot was visible there but missing on cold start.
+  scheduleBootEnvSnapshot();
+
+  if (desktopTraySupported) {
+    await initDesktopWindowBeforeRunApp(startHidden: launchedAtStartup);
+    logBoot.info('boot: desktop window ready');
+  }
+
+  final themeStore = ThemeStore();
+  final colorThemeStore = ColorThemeStore();
+  final fontSizeStore = FontSizeStore();
+  await fontSizeStore.load();
+  final appRoot = UncontrolledProviderScope(
+    container: container,
+    child: MyApp(
+      navigatorKey: navigatorKey,
+      themeStore: themeStore,
+      colorThemeStore: colorThemeStore,
+      fontSizeStore: fontSizeStore,
+      localeRegionStore: localeRegionStore,
+      initialOfflineWithoutLogin: offlineWithoutLogin,
+    ),
+  );
+  // Desktop: skip global glass wrap to reduce route-transition cost; narrow
+  // windows may still use GlassBackdropScope / GlassBottomBar (initialize()).
+  // Mobile: fixed tier avoids mid-session downgrades on the tab bar; revisit
+  // if old devices need the adaptive benchmark.
+  final isDesktop = Platform.isWindows || Platform.isMacOS || Platform.isLinux;
+  final desktopAppRoot = Platform.isWindows
+      ? DesktopWindowCloseShortcuts(child: appRoot)
+      : appRoot;
+  logBoot.info('boot: calling runApp');
+  runApp(
+    isDesktop
+        ? desktopAppRoot
+        : LiquidGlassWidgets.wrap(adaptiveQuality: false, child: appRoot),
+  );
+
+  // Distinguishes "first frame rendered" from "main() reached runApp but the
+  // rasterizer never painted" when triaging white-screen reports.
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    logBoot.info('first frame rendered');
+  });
+
+  if (desktopTraySupported) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      initDesktopTrayAfterFirstFrame();
+    });
+  }
+}
+
+/// Minimal, theme-independent screen shown when startup fails before the app
+/// UI can render. Replaces a silent white window with the error, stack trace
+/// and log-file path so users can screenshot or send it to support.
+class BootFailureApp extends StatelessWidget {
+  const BootFailureApp({
+    super.key,
+    required this.error,
+    required this.stackTrace,
+    this.logFilePath,
+  });
+
+  final Object error;
+  final StackTrace stackTrace;
+  final String? logFilePath;
+
+  @override
+  Widget build(BuildContext context) {
+    final buffer = StringBuffer()
+      ..writeln('启动失败 / Startup failed')
+      ..writeln()
+      ..writeln(error.toString())
+      ..writeln()
+      ..writeln(stackTrace.toString());
+    if (logFilePath != null) {
+      buffer
+        ..writeln()
+        ..writeln('日志文件 / Log file:')
+        ..writeln(logFilePath);
+    }
+    final recoveryHint = bootFailureRecoveryHint(error);
+    if (recoveryHint != null) {
+      buffer
+        ..writeln()
+        ..writeln(recoveryHint);
+    }
+    final text = buffer.toString();
+    return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        backgroundColor: const Color(0xFF1A1A1A),
+        body: SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '应用启动失败',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  '请截图本页面或把日志文件发给开发者协助排查。',
+                  style: TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: OutlinedButton(
+                    onPressed: () {
+                      Clipboard.setData(ClipboardData(text: text));
+                    },
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white54),
+                    ),
+                    child: const Text('复制错误信息'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: SingleChildScrollView(
+                    child: SelectableText(
+                      text,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _UpdateCheckWrapper extends StatefulWidget {
+  final GlobalKey<NavigatorState> navigatorKey;
+  final Widget? child;
+
+  const _UpdateCheckWrapper({required this.navigatorKey, this.child});
+
+  @override
+  State<_UpdateCheckWrapper> createState() => _UpdateCheckWrapperState();
+}
+
+class _UpdateCheckWrapperState extends State<_UpdateCheckWrapper> {
+  @override
+  void initState() {
+    super.initState();
+    if (Platform.isAndroid || Platform.isIOS) {
+      ShareReceiveService.instance.onFilesSavedFromShare =
+          _onFilesSavedFromShare;
+      ShareReceiveService.instance.init();
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // 纯局域网版：云端应用更新检查已移除。
+    });
+  }
+
+  @override
+  void dispose() {
+    if (Platform.isAndroid || Platform.isIOS) {
+      ShareReceiveService.instance.dispose();
+      ShareReceiveService.instance.onFilesSavedFromShare = null;
+    }
+    super.dispose();
+  }
+
+  Future<void> _onFilesSavedFromShare(int count, List<dynamic> files) async {
+    if (!mounted) return;
+    var totalBytes = 0;
+    final platformFiles = <PlatformFile>[];
+    for (final f in files) {
+      if (f is PlatformFile) {
+        platformFiles.add(f);
+        totalBytes += f.size;
+      }
+    }
+    Analytics.track(AnalyticsEvents.shareIntoAppReceived, {
+      'file_count': count,
+      'total_size_bucket': Analytics.sizeBucket(totalBytes),
+    });
+    final ctx = widget.navigatorKey.currentContext;
+    if (ctx == null) return;
+    if (platformFiles.isNotEmpty) {
+      await ProviderScope.containerOf(ctx, listen: false)
+          .read(pendingFilesProvider.notifier)
+          .add(
+            platformFiles
+                .map((f) => PendingFileEntry.fromPlatformFile(f))
+                .toList(),
+          );
+    }
+    if (!mounted) return;
+    final msg = count == 1 ? '已添加 1 个文件到待发文件箱' : '已添加 $count 个文件到待发文件箱';
+    AppToast.show(ctx, message: msg);
+    final applyPending = ShareReceiveService.instance.onPendingShareReady;
+    if (applyPending != null) {
+      applyPending();
+      return;
+    }
+    Navigator.of(ctx).pushNamedAndRemoveUntil('/', (_) => false);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    // 让状态栏透明，与应用背景融为一体
+    final overlayStyle = SystemUiOverlayStyle(
+      statusBarColor: Colors.transparent,
+      statusBarIconBrightness: isDark ? Brightness.light : Brightness.dark,
+      statusBarBrightness: isDark ? Brightness.dark : Brightness.light,
+    );
+
+    final child = AnnotatedRegion<SystemUiOverlayStyle>(
+      value: overlayStyle,
+      child: widget.child ?? const SizedBox.shrink(),
+    );
+    // 纯局域网版：内置云端更新器已移除，直接返回子树。
+    return child;
+  }
+}
+
+class MyApp extends StatelessWidget {
+  final GlobalKey<NavigatorState> navigatorKey;
+  final ThemeStore themeStore;
+  final ColorThemeStore colorThemeStore;
+  final FontSizeStore fontSizeStore;
+  final LocaleRegionStore localeRegionStore;
+  final bool initialOfflineWithoutLogin;
+
+  const MyApp({
+    super.key,
+    required this.navigatorKey,
+    required this.themeStore,
+    required this.colorThemeStore,
+    required this.fontSizeStore,
+    required this.localeRegionStore,
+    required this.initialOfflineWithoutLogin,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return LocaleRegionStoreScope(
+      store: localeRegionStore,
+      child: ThemeStoreScope(
+        store: themeStore,
+        child: ColorThemeStoreScope(
+          store: colorThemeStore,
+          child: FontSizeStoreScope(
+            store: fontSizeStore,
+            child: ValueListenableBuilder<ThemeMode>(
+              valueListenable: themeStore.notifier,
+              builder: (_, themeMode, __) {
+                return ValueListenableBuilder<AppColorTheme>(
+                  valueListenable: colorThemeStore.notifier,
+                  builder: (_, colorTheme, __) {
+                    return ValueListenableBuilder<FontSizeLevel>(
+                      valueListenable: fontSizeStore.notifier,
+                      builder: (_, fontSizeLevel, __) {
+                        return ValueListenableBuilder<FontWeightLevel>(
+                          valueListenable: fontSizeStore.weightNotifier,
+                          builder: (_, fontWeightLevel, __) {
+                            return ValueListenableBuilder<LocaleRegionState>(
+                              valueListenable: localeRegionStore.notifier,
+                              builder: (_, lr, __) {
+                                final l10n = lookupAppLocalizations(lr.locale);
+                                final taskTitle = brandProductName(
+                                  l10n,
+                                  lr.serviceRegion,
+                                );
+                                final textScale = scaleForFontSizeLevel(
+                                  fontSizeLevel,
+                                );
+                                final baseWght = wghtForFontWeightLevel(
+                                  fontWeightLevel,
+                                );
+                                return OKToast(
+                                  position: ToastPosition(
+                                    align: Alignment(0, -0.4),
+                                    offset: 0,
+                                  ),
+                                  textPadding: const EdgeInsets.symmetric(
+                                    horizontal: 20,
+                                    vertical: 12,
+                                  ),
+                                  radius: 12,
+                                  child: MaterialApp(
+                                    debugShowCheckedModeBanner: false,
+                                    navigatorKey: navigatorKey,
+                                    navigatorObservers: [
+                                      NativeTabBarNavigatorObserver(),
+                                    ],
+                                    locale: lr.locale,
+                                    title: taskTitle,
+                                    themeMode: themeMode,
+                                    theme: buildAppTheme(
+                                      colorTheme: colorTheme,
+                                      brightness: Brightness.light,
+                                      baseWght: baseWght,
+                                    ),
+                                    darkTheme: buildAppTheme(
+                                      colorTheme: colorTheme,
+                                      brightness: Brightness.dark,
+                                      baseWght: baseWght,
+                                    ),
+                                    localizationsDelegates: [
+                                      ...AppLocalizations
+                                          .localizationsDelegates,
+                                      CountryLocalizations.delegate,
+                                    ],
+                                    supportedLocales:
+                                        AppLocalizations.supportedLocales,
+                                    initialRoute: '/',
+                                    routes: {
+                                      ...productRoutes,
+                                      '/': (_) => AppEntryScreen(
+                                        localeRegionStore: localeRegionStore,
+                                        initialOfflineWithoutLogin:
+                                            initialOfflineWithoutLogin,
+                                      ),
+                                    },
+                                    builder: (context, child) => MediaQuery(
+                                      data: MediaQuery.of(context).copyWith(
+                                        textScaler: TextScaler.linear(
+                                          textScale,
+                                        ),
+                                      ),
+                                      child: DesktopFileDropScope(
+                                        navigatorKey: navigatorKey,
+                                        locale: lr.locale,
+                                        child: AuthSessionLifecycle(
+                                          child: RealtimeHubLifecycle(
+                                            child: _UpdateCheckWrapper(
+                                              navigatorKey: navigatorKey,
+                                              child: child,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
+                            );
+                          },
+                        );
+                      },
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

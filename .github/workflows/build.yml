@@ -1,0 +1,125 @@
+name: Build (GodSend LAN)
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-x64:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      # 仓库含长路径文件，必须先开启 Git longpaths 再 checkout
+      - name: Enable long paths for Git (Windows)
+        run: git config --global core.longpaths true
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Pub get
+        working-directory: app
+        run: flutter pub get
+
+      - name: Enable bundled font assets
+        working-directory: app
+        run: ./scripts/windows_font_assets.ps1 enable
+
+      # 注：pdfrx 2.x 通过 native assets hook 自动下载 pdfium，不再需要预置脚本。
+
+      - name: Build Windows (x64, release)
+        working-directory: app
+        env:
+          # VS2026 (MSVC 14.51) 将 <experimental/coroutine> 列为硬错误（STL1011）。
+          # 此宏为微软官方提供的抑制开关，恢复为仅警告。
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+        run: flutter build windows --release
+
+      - name: Package zip (portable)
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path app/pubspec.yaml -Pattern '^version:\s*(.+)$').Matches[0].Groups[1].Value.Trim().Split('+')[0]
+          New-Item -ItemType Directory -Force -Path stage/GodSend | Out-Null
+          Copy-Item -Path 'app/build/windows/x64/runner/Release/*' -Destination 'stage/GodSend/' -Recurse -Force
+          $out = "GodSend-windows-x64-$ver.zip"
+          Compress-Archive -Path 'stage/GodSend' -DestinationPath $out -Force
+          Remove-Item -Recurse -Force stage
+          "ZIP_NAME=$out" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-Item $out | Select-Object Name, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+  build-android-arm64:
+    name: Android arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Generate debug keystore (CI signing fallback)
+        run: |
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -v \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 \
+              -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Pub get
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build APK (arm64-v8a, release)
+        working-directory: app
+        run: flutter build apk --release --flavor direct --target-platform android-arm64 --split-per-abi
+
+      - name: Collect APK (arm64-v8a, single file)
+        run: |
+          mkdir -p dist
+          echo "All built APKs:"
+          find app/build -type f -name '*.apk' | sort
+          VER=$(grep '^version:' app/pubspec.yaml | sed 's/version: //; s/+.*//' | tr -d '[:space:]')
+          # 优先取 flutter-apk 目录下的 arm64 release 包（Gradle 后处理可能已改名，取最新一份）
+          APK=$(find app/build -type f -name '*.apk' \
+                | grep -E 'arm64' | grep -E 'release' \
+                | xargs -r ls -t | head -1)
+          if [ -z "$APK" ]; then echo "No arm64 release APK found"; exit 1; fi
+          cp "$APK" "dist/GodSend-android-arm64-v8a-$VER.apk"
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64
+          path: dist/*.apk
+          if-no-files-found: error
