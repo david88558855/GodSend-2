@@ -193,10 +193,10 @@ class DeviceListPanel extends ConsumerWidget {
                     body = ScrollConfiguration(
                       behavior: ScrollConfiguration.of(context).copyWith(
                         dragDevices: {
-                          ui.PointerDeviceKind.touch,
-                          ui.PointerDeviceKind.mouse,
-                          ui.PointerDeviceKind.trackpad,
-                          ui.PointerDeviceKind.stylus,
+                          PointerDeviceKind.touch,
+                          PointerDeviceKind.mouse,
+                          PointerDeviceKind.trackpad,
+                          PointerDeviceKind.stylus,
                         },
                       ),
                       child: RefreshIndicator(
