@@ -1,3 +1,5 @@
+import 'dart:ui' show PointerDeviceKind;
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -173,16 +175,37 @@ class DeviceListPanel extends ConsumerWidget {
                   children: listChildren,
                 );
 
-                if (RuntimePlatform.isMobile && onRefresh != null) {
-                  body = RefreshIndicator(
-                    onRefresh: onRefresh!,
-                    color: theme.colorScheme.primary,
-                    child: ListView(
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      padding: EdgeInsets.fromLTRB(0, 2, 0, 2 + scrollBottom),
-                      children: listChildren,
-                    ),
+                if (onRefresh != null) {
+                  final deviceListView = ListView(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: EdgeInsets.fromLTRB(0, 2, 0, 2 + scrollBottom),
+                    children: listChildren,
                   );
+                  if (RuntimePlatform.isMobile) {
+                    body = RefreshIndicator(
+                      onRefresh: onRefresh!,
+                      color: theme.colorScheme.primary,
+                      child: deviceListView,
+                    );
+                  } else {
+                    // 桌面端（Windows 等）：允许鼠标/触控板拖拽产生过滚动，
+                    // 与移动端一致地支持下拉刷新设备列表。
+                    body = ScrollConfiguration(
+                      behavior: ScrollConfiguration.of(context).copyWith(
+                        dragDevices: {
+                          ui.PointerDeviceKind.touch,
+                          ui.PointerDeviceKind.mouse,
+                          ui.PointerDeviceKind.trackpad,
+                          ui.PointerDeviceKind.stylus,
+                        },
+                      ),
+                      child: RefreshIndicator(
+                        onRefresh: onRefresh!,
+                        color: theme.colorScheme.primary,
+                        child: deviceListView,
+                      ),
+                    );
+                  }
                 }
 
                 return body;
